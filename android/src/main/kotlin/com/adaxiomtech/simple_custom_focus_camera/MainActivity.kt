@@ -387,39 +387,44 @@ class CustomCameraView(
                 return
             }
 
-            android.util.Log.d("CustomCamera", "Configuring transform: view=$viewWidth x $viewHeight, preview=$previewWidth x $previewHeight")
+            android.util.Log.d("CustomCamera", "Configuring transform: view=$viewWidth x $viewHeight, preview=$previewWidth x $previewHeight, sensorOrientation=$sensorOrientation")
 
-            // Calculate aspect ratios
+            // When sensor orientation is 90° or 270°, the preview is rotated
+            // We need to swap width/height for correct aspect ratio calculation
+            val needsRotation = sensorOrientation == 90 || sensorOrientation == 270
+            val effectivePreviewWidth = if (needsRotation) previewHeight else previewWidth
+            val effectivePreviewHeight = if (needsRotation) previewWidth else previewHeight
+
+            // Calculate aspect ratios using effective dimensions
             val viewAspect = viewWidth.toFloat() / viewHeight
-            val previewAspect = previewWidth.toFloat() / previewHeight
+            val previewAspect = effectivePreviewWidth.toFloat() / effectivePreviewHeight
 
-            // Calculate scale factors for both dimensions
-            val scaleX = viewWidth.toFloat() / previewWidth
-            val scaleY = viewHeight.toFloat() / previewHeight
-
-            // Use the larger scale to fill the screen (center crop behavior)
-            // This ensures the preview fills the entire view without black bars
-            val scale = scaleX.coerceAtLeast(scaleY)
-
-            android.util.Log.d("CustomCamera", "Aspect ratios: view=$viewAspect, preview=$previewAspect, scale=$scale")
+            android.util.Log.d("CustomCamera", "Effective preview after rotation: $effectivePreviewWidth x $effectivePreviewHeight")
+            android.util.Log.d("CustomCamera", "Aspect ratios: view=$viewAspect, preview=$previewAspect")
 
             // Create transform matrix
             val matrix = Matrix()
 
-            // Apply scaling
-            matrix.setScale(scale, scale)
+            // Calculate scale factors using effective dimensions
+            val scaleX = viewWidth.toFloat() / effectivePreviewWidth
+            val scaleY = viewHeight.toFloat() / effectivePreviewHeight
+            
+            // Use the MINIMUM scale for both dimensions to fit without cropping or stretching
+            // This maintains aspect ratio and shows the full preview
+            val scale = scaleX.coerceAtMost(scaleY)
 
-            // Center the preview after scaling
-            val scaledWidth = previewWidth * scale
-            val scaledHeight = previewHeight * scale
+            // Center the preview using effective dimensions
+            val scaledWidth = effectivePreviewWidth * scale
+            val scaledHeight = effectivePreviewHeight * scale
             val dx = (viewWidth - scaledWidth) / 2f
             val dy = (viewHeight - scaledHeight) / 2f
 
+            matrix.setScale(scale, scale)
             matrix.postTranslate(dx, dy)
 
             // Apply the transform
             view.setTransform(matrix)
-            android.util.Log.d("CustomCamera", "Transform applied successfully: scale=$scale, dx=$dx, dy=$dy")
+            android.util.Log.d("CustomCamera", "Transform applied: scale=$scale, dx=$dx, dy=$dy")
 
 
         } catch (e: Exception) {
@@ -684,28 +689,80 @@ class CustomCameraView(
      */
     private fun createPreviewSurface(): Surface? {
         val texture = textureView?.surfaceTexture ?: return null
+        val view = textureView ?: return null
         val characteristics = getCameraCharacteristics()
         sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
 
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
         val sizes = map.getOutputSizes(SurfaceTexture::class.java)
 
-        // Get Screen Dimensions
-        val displayMetrics = context.resources.displayMetrics
-        val screenWidth = displayMetrics.widthPixels
-        val screenHeight = displayMetrics.heightPixels
+        // Use the actual TextureView dimensions, not screen dimensions
+        val viewWidth = view.width
+        val viewHeight = view.height
+        
+        android.util.Log.d("CustomCamera", "TextureView dimensions: $viewWidth x $viewHeight")
 
-        // Swap dimensions if the sensor is rotated (Portrait mode)
-        val isPortrait = screenHeight > screenWidth
-        val targetWidth = if (isPortrait) screenHeight else screenWidth
-        val targetHeight = if (isPortrait) screenWidth else screenHeight
+        // If view dimensions are not available yet, use screen dimensions as fallback
+        val targetWidth: Int
+        val targetHeight: Int
+        
+        if (viewWidth > 0 && viewHeight > 0) {
+            targetWidth = viewWidth
+            targetHeight = viewHeight
+        } else {
+            // Fallback to screen dimensions
+            val displayMetrics = context.resources.displayMetrics
+            targetWidth = displayMetrics.widthPixels
+            targetHeight = displayMetrics.heightPixels
+            android.util.Log.w("CustomCamera", "View dimensions not available, using screen: $targetWidth x $targetHeight")
+        }
 
-        // Find the best matching size based on aspect ratio
+        // Calculate target aspect ratio
         val targetRatio = targetWidth.toFloat() / targetHeight
-        val bestSize = sizes.minByOrNull {
-            abs((it.width.toFloat() / it.height) - targetRatio)
-        } ?: sizes[0]
+        
+        android.util.Log.d("CustomCamera", "Target dimensions: $targetWidth x $targetHeight (ratio: $targetRatio)")
+        android.util.Log.d("CustomCamera", "Sensor orientation: $sensorOrientation")
+        
+        // Log available sizes for debugging
+        android.util.Log.d("CustomCamera", "Available preview sizes:")
+        sizes.take(10).forEach {
+            android.util.Log.d("CustomCamera", "  ${it.width} x ${it.height} (ratio: ${it.width.toFloat() / it.height})")
+        }
 
+        // Camera preview sizes are typically in sensor orientation (usually landscape)
+        // For portrait views, we need to compare with the inverse ratio
+        val needsRotation = sensorOrientation == 90 || sensorOrientation == 270
+        
+        val bestSize = sizes
+            .filter { size ->
+                // Calculate the aspect ratio we'll actually see after rotation
+                val previewRatio = if (needsRotation) {
+                    size.height.toFloat() / size.width  // Swap for rotation
+                } else {
+                    size.width.toFloat() / size.height
+                }
+                
+                // Filter out sizes with extreme aspect ratio mismatches (>30% difference)
+                val ratioDiff = abs(previewRatio - targetRatio) / targetRatio
+                ratioDiff < 0.3
+            }
+            .minByOrNull { size ->
+                // Find the best match by aspect ratio
+                val previewRatio = if (needsRotation) {
+                    size.height.toFloat() / size.width
+                } else {
+                    size.width.toFloat() / size.height
+                }
+                abs(previewRatio - targetRatio)
+            } ?: sizes.maxByOrNull { it.width * it.height } ?: sizes[0]  // Fallback to largest if no good match
+
+        android.util.Log.d("CustomCamera", "Selected preview size: ${bestSize.width} x ${bestSize.height} (ratio: ${bestSize.width.toFloat() / bestSize.height})")
+        val effectiveRatio = if (needsRotation) {
+            bestSize.height.toFloat() / bestSize.width
+        } else {
+            bestSize.width.toFloat() / bestSize.height
+        }
+        android.util.Log.d("CustomCamera", "Effective ratio after rotation: $effectiveRatio (target: $targetRatio)")
         previewSize = bestSize
         texture.setDefaultBufferSize(bestSize.width, bestSize.height)
 
